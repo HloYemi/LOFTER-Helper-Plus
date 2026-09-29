@@ -2,7 +2,7 @@
 
 > 基于 [Lumiarna](https://greasyfork.org/zh-CN/scripts/568674) 的 **LOFTER Helper** 修改而来。
 > 增强批量导出、标签搜索、暂停/取消、并发下载等能力。
-
+> 使用需要登录。
 ---
 
 ## 📖 简介
