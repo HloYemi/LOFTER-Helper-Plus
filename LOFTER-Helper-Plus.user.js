@@ -2,7 +2,7 @@
 // @name         LOFTER Helper Plus
 // @name:zh-CN   LOFTER 合集/单篇导出助手（增强版）
 // @namespace    https://github.com/HloYemi/LOFTER-Helper-Plus
-// @version      3.1.2
+// @version      3.1.4
 // @description  LOFTER 一键导出合集/单篇。支持作者主页批量导出（基于API）、标签搜索、暂停/继续/取消、并发抓取、合集识别、关键词筛选、图片下载。
 // @description:zh-CN  LOFTER 一键导出合集/单篇。支持作者主页批量导出（基于API）、标签搜索、暂停/继续/取消、并发抓取、合集识别、关键词筛选、图片下载。
 // @author       Lumiarna, HloYemi
@@ -20,8 +20,8 @@
 // @run-at       document-idle
 // @license      MIT
 // @require      https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js
-// @downloadURL  https://update.greasyfork.org/scripts/597927/LOFTER-Helper-Plus.user.js
-// @updateURL    https://update.greasyfork.org/scripts/597927/LOFTER-Helper-Plus.meta.js
+// @downloadURL https://update.greasyfork.org/scripts/597927/LOFTER%20Helper%20Plus.user.js
+// @updateURL https://update.greasyfork.org/scripts/597927/LOFTER%20Helper%20Plus.meta.js
 // ==/UserScript==
 
 (function () {
@@ -379,7 +379,6 @@
             const post = item.post || item;
             const url = post.blogPageUrl || post.postUrl || '';
             const title = post.title || post.noticeLinkTitle || '';
-            // tagList 是字符串数组，直接 join
             const tags = Array.isArray(post.tagList) ? post.tagList.filter(Boolean).join(' ') : '';
 
             if (url) {
@@ -503,7 +502,12 @@
     const doc = new DOMParser().parseFromString(`<div class="post-content">${post.content}</div>`, 'text/html');
     const content = extractText(doc.body);
     const images = extractImages(post);
-    const title = post.title || post.noticeLinkTitle || post.postCollection?.name || '未命名';
+    const captionText = (post.caption || '').replace(/<[^>]+>/g, '').trim();
+    const title = post.title
+      || post.noticeLinkTitle
+      || captionText
+      || post.postCollection?.name
+      || '未命名';
     return {
       url: post.blogPageUrl || '',
       title, content, images,
@@ -678,7 +682,17 @@
 
     if (taskControl.isCancelled()) throw new Error('CANCELLED');
     if (!Object.keys(files).length) throw new Error('当前设置会跳过全部内容，没有可导出的文章');
-    const zipped = fflate.zipSync(files);
+
+    // 异步压缩，避免阻塞主线程
+    onProgress?.('正在打包 ZIP…');
+    await delay(50);
+    const zipped = await new Promise((resolve, reject) => {
+      fflate.zip(files, { level: 6 }, (err, data) => {
+        if (err) reject(err);
+        else resolve(data);
+      });
+    });
+    onProgress?.('正在下载 ZIP…');
     downloadBlob(new Blob([zipped], { type: 'application/zip' }), `${folder}.zip`);
   }
 
@@ -752,9 +766,9 @@
       .success { top: 40px; background: #28a745; }
       .pause-btn { top: 80px; background: #f0ad4e; }
       .cancel-btn { top: 120px; background: #d9534f; }
-      .settings-btn { position: fixed; right: 10px; z-index: 999999; padding: 6px 10px; border: none; border-radius: 6px; background: #555; color: #fff; font-size: 16px; line-height: 1; cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,.15); transition: opacity .2s, transform .3s; }
+      .settings-btn { position: fixed; right: 120px; top: 80px; z-index: 999999; padding: 8px 12px; border: none; border-radius: 6px; background: #555; color: #fff; font-size: 15px; line-height: 1.4; cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,.15); transition: opacity .2s, transform .3s; }
       .settings-btn:hover { opacity: .85; transform: rotate(45deg); }
-      .settings-panel { display: none; position: fixed; right: 56px; z-index: 999999; width: 180px; padding: 16px; border-radius: 10px; background: #fff; border: 1px solid #ddd; color: #333; font: 14px/1.6 system-ui, sans-serif; box-shadow: 0 4px 20px rgba(0,0,0,.2); overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
+      .settings-panel { display: none; position: fixed; right: 120px; top: 124px; z-index: 999999; width: 180px; padding: 16px; border-radius: 10px; background: #fff; border: 1px solid #ddd; color: #333; font: 14px/1.6 system-ui, sans-serif; box-shadow: 0 4px 20px rgba(0,0,0,.2); overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; max-height: calc(100vh - 100px); }
       .settings-panel.open { display: block; }
       .settings-panel h3 { margin: 0 0 12px; font-size: 15px; font-weight: 600; color: #222; text-align: center; }
       .settings-panel label { display: flex; align-items: center; gap: 6px; margin: 4px 0; cursor: pointer; font-size: 13px; }
@@ -781,7 +795,7 @@
     return btn;
   }
 
-  function createSettingsUI(topOffset) {
+  function createSettingsUI() {
     const root = initShadowHost();
     const collectionGroupsHtml = isArchive && archiveCollections.length
       ? archiveCollections.map((collection, index) => {
@@ -800,13 +814,10 @@
       ? `<div class="settings-note">${escapeHtml(collectionsLoadError)}</div>` : '';
     const btn = document.createElement('div');
     btn.className = 'settings-btn';
-    btn.style.top = `${topOffset}px`;
     btn.textContent = '⚙';
     root.append(btn);
     const panel = document.createElement('div');
     panel.className = 'settings-panel';
-    panel.style.top = `${topOffset}px`;
-    panel.style.maxHeight = `calc(100vh - ${topOffset + 24}px)`;
     panel.innerHTML = `
       <h3>设置</h3>
       <div class="group-title">导出格式</div>
@@ -841,7 +852,7 @@
         }
         btn.remove();
         panel.remove();
-        createSettingsUI(topOffset);
+        createSettingsUI();
       }
     });
     panel.querySelectorAll('input[name="fmt"]').forEach(radio => {
@@ -1045,27 +1056,27 @@
     }
   }
 
-  function initPageActions(actions, settingsTopOffset) {
+  function initPageActions(actions) {
     for (const action of actions) {
       const btn = createBtn(action.label, action.modifier);
       btn.addEventListener('click', () => runExport({ mode: action.mode, btn }));
     }
     createTaskControls();
-    createSettingsUI(settingsTopOffset);
+    createSettingsUI();
   }
 
   async function init() {
     author = getPageAuthor() || 'LOFTER';
 
     if (isAuthorHome) {
-      initPageActions([{ label: '导出全部', modifier: 'primary', mode: EXPORT_MODE.ARCHIVE }], 80);
+      initPageActions([{ label: '导出全部', modifier: 'primary', mode: EXPORT_MODE.ARCHIVE }]);
       return;
     }
 
     if (isArchive) {
-      initPageActions([{ label: '导出全部', modifier: 'primary', mode: EXPORT_MODE.ARCHIVE }], 80);
+      initPageActions([{ label: '导出全部', modifier: 'primary', mode: EXPORT_MODE.ARCHIVE }]);
     } else {
-      initPageActions([{ label: '导出本篇', modifier: 'success', mode: EXPORT_MODE.ORIGIN }], 80);
+      initPageActions([{ label: '导出本篇', modifier: 'success', mode: EXPORT_MODE.ORIGIN }]);
       fetchPostDetail(location.href)
         .then(post => updateCollectionDisplay(post?.postCollection?.name || ''))
         .catch(() => updateCollectionDisplay(''));
