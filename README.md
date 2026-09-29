@@ -25,11 +25,9 @@
 
 1. 安装 [Tampermonkey](https://www.tampermonkey.net/) 浏览器扩展。
 2. 在 Tampermonkey 中添加本脚本：
-   - 方式一：打开 Greasy Fork 脚本页面，点击“安装”。
-   - 方式二：复制本仓库中的 `LOFTER-Helper-Plus.user.js` 全文，在 Tampermonkey 中“添加新脚本”并粘贴保存。
-3. 打开 LOFTER 任意页面，确认脚本已启用。
-[![安装](https://img.shields.io/badge/安装-LOFTER%20Helper%20Plus-brightgreen?logo=tampermonkey)](https://cdn.jsdelivr.net/gh/HloYemi/LOFTER-Helper-Plus@main/LOFTER-Helper-Plus.user.js)
-[![Greasy Fork](https://img.shields.io/badge/安装-Greasy%20Fork-blue?logo=greasyfork)](https://greasyfork.org/zh-CN/scripts/597927-lofter-helper-plus)
+   - 方式一：[![Greasy Fork](https://img.shields.io/badge/安装-Greasy%20Fork-blue?logo=greasyfork)](https://greasyfork.org/zh-CN/scripts/597927-lofter-helper-plus)
+   - 方式二：[![安装](https://img.shields.io/badge/安装-LOFTER%20Helper%20Plus-brightgreen?logo=tampermonkey)](https://cdn.jsdelivr.net/gh/HloYemi/LOFTER-Helper-Plus@main/LOFTER-Helper-Plus.user.js)
+3. 打开 LOFTER 任意页面，网页右上角会出现按钮，确认脚本已启用。
 ---
 
 ## 🔧 与原版 LOFTER Helper 的主要区别
