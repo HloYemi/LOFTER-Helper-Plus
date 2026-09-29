@@ -1,13 +1,12 @@
 // ==UserScript==
 // @name         LOFTER Helper Plus
-// @namespace    http://tampermonkey.net/
+// @name:zh-CN   LOFTER 合集/单篇导出助手（增强版）
+// @namespace    https://github.com/HloYemi/LOFTER-Helper-Plus
 // @version      3.1.2
 // @description  LOFTER 一键导出合集/单篇。支持作者主页批量导出（基于API）、标签搜索、暂停/继续/取消、并发抓取、合集识别、关键词筛选、图片下载。
-// @author       原脚本@Lumiarna、修改@hloyemi、协助修改@DeepSeek
-// @match        *://*.lofter.com/view*
-// @match        *://*.lofter.com/post/*
-// @match        *://*.lofter.com/collection/*
-// @match        *://*.lofter.com/
+// @description:zh-CN  LOFTER 一键导出合集/单篇。支持作者主页批量导出（基于API）、标签搜索、暂停/继续/取消、并发抓取、合集识别、关键词筛选、图片下载。
+// @author       Lumiarna, HloYemi
+// @match        *://*.lofter.com/*
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM.xmlHttpRequest
@@ -21,6 +20,8 @@
 // @run-at       document-idle
 // @license      MIT
 // @require      https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js
+// @downloadURL  https://update.greasyfork.org/scripts/597927/LOFTER-Helper-Plus.user.js
+// @updateURL    https://update.greasyfork.org/scripts/597927/LOFTER-Helper-Plus.meta.js
 // ==/UserScript==
 
 (function () {
