@@ -1,6 +1,3 @@
-# LOFTER-Helper-Plus
-LOFTER 一键导出合集/单篇。支持作者主页批量导出（基于API）、标签搜索、暂停/继续/取消、并发抓取、合集识别、关键词筛选、图片下载。
-
 # LOFTER Helper Plus
 
 > 基于 [Lumiarna](https://greasyfork.org/zh-CN/scripts/568674) 的 **LOFTER Helper** 修改而来。
@@ -38,7 +35,7 @@ LOFTER 一键导出合集/单篇。支持作者主页批量导出（基于API）
 - 再逐个合集请求 `getCollectionDetail`
 - 一次性拿到作者所有合集内的文章
 
-**参考了 [SrakhiuMeow/lofter-getter](https://github.com/SrakhiuMeow/lofter-getter) 的 API 调用思路。**
+参考了 [SrakhiuMeow/lofter-getter](https://github.com/SrakhiuMeow/lofter-getter) 的 API 调用思路。
 
 ### 2. 修复关键词搜索
 
@@ -67,6 +64,26 @@ LOFTER 一键导出合集/单篇。支持作者主页批量导出（基于API）
 
 LOFTER 部分图片使用 `nos.netease.com` 域名，脚本请求会返回 403。  
 现在自动将：
+
+```
+https://nos.netease.com/imglf6/xxx
+```
+
+重写为：
+
+```
+https://imglf6.lf127.net/xxx
+```
+
+同时下载图片时携带 `Referer: https://www.lofter.com/`，绕过防盗链。
+
+### 6. 图片文件名加入原文地址
+
+单篇和合集导出的图片文件名中会包含文章地址（去掉 `https://`），例如：
+
+```
+LOFTER_祢尔MERE_原神堆堆_发发头像_miermere.lofter.com_post_4d02bec5_2b76b7b09_01.jpg
+```
 
 ### 7. 主页懒加载，减少页面负担
 
@@ -142,7 +159,7 @@ LOFTER 部分图片使用 `nos.netease.com` 域名，脚本请求会返回 403�
 
 - 原脚本作者：[Lumiarna](https://greasyfork.org/zh-CN/scripts/568674)（LOFTER Helper）
 - API 调用思路参考：[SrakhiuMeow](https://github.com/SrakhiuMeow/lofter-getter)（lofter-getter）
-- 修改与维护：<你的ID>
+- 修改与维护：[HloYemi/LOFTER-Helper-Plus](https://github.com/HloYemi/LOFTER-Helper-Plus)
 
 ---
 
