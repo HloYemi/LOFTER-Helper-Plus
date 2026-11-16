@@ -29,87 +29,11 @@
    - 方式二：[![安装](https://img.shields.io/badge/安装-LOFTER%20Helper%20Plus-brightgreen?logo=tampermonkey)](https://cdn.jsdelivr.net/gh/HloYemi/LOFTER-Helper-Plus@main/LOFTER-Helper-Plus.user.js)
 3. 打开 LOFTER 任意页面，网页右上角会出现按钮，确认脚本已启用。
 ---
-
-## 🔧 与原版 LOFTER Helper 的主要区别
-
-本脚本在原版基础上做了以下修改：
-
-### 1. 改用 API 获取作者全部文章
-
-原版依赖页面滚动加载，容易漏文章、翻页逻辑也不稳定。  
-现在改为通过 LOFTER API：
-
-- 先请求合集列表 `getCollectionList`
-- 再逐个合集请求 `getCollectionDetail`
-- 一次性拿到作者所有合集内的文章
-
-参考了 [SrakhiuMeow/lofter-getter](https://github.com/SrakhiuMeow/lofter-getter) 的 API 调用思路。
-
-### 2. 修复关键词搜索
-
-原版只能按标题匹配，而 LOFTER 上大量图片贴标题为空，导致搜不到。
-
-现在搜索同时匹配：
-
-- `post.title`
-- `post.tagList`（标签数组，直接 join 成字符串）
-- `collectionName`（合集名）
-
-### 3. 新增暂停 / 继续 / 取消
-
-导出过程中，页面右侧会出现：
-
-- **⏸ 暂停**：暂停所有抓取任务，可恢复
-- **✕ 取消**：立即终止当前导出，已下载内容不会写出 ZIP
-
-### 4. 并发抓取，速度优化
-
-- 文章抓取并发：4
-- 图片下载并发：4
-- 请求间隔从 800ms / 300ms 降至 200ms / 80ms
-
-### 5. 修复图片 403 问题
-
-LOFTER 部分图片使用 `nos.netease.com` 域名，脚本请求会返回 403。  
-现在自动将：
-
-```
-https://nos.netease.com/imglf6/xxx
-```
-
-重写为：
-
-```
-https://imglf6.lf127.net/xxx
-```
-
-同时下载图片时携带 `Referer: https://www.lofter.com/`，绕过防盗链。
-
-### 6. 图片文件名加入原文地址
-
-单篇和合集导出的图片文件名中会包含文章地址（去掉 `https://`），例如：
-
-```
-LOFTER_祢尔MERE_原神堆堆_发发头像_miermere.lofter.com_post_4d02bec5_2b76b7b09_01.jpg
-```
-
-### 7. 主页懒加载，减少页面负担
-
-打开作者主页时不会自动请求 API，只有点击“导出全部”按钮后才开始拉取文章列表。  
-设置面板中的合集策略也是按需加载。
-
-### 8. 其他细节
-
-- 单篇文件名格式：`LOFTER_作者_合集名_贴文名`
-- 合集导出按合集分文件夹，图片按文章序号命名
-- 支持 Markdown / TXT 两种导出格式
-- 兼容 `photoLinks` 为字符串或数组两种情况
----
 ## 🚀 使用
 
 ### 导出作者全部作品
 
-1. 打开作者主页，例如 `https://miermere.lofter.com/`
+1. 打开作者主页，例如 `https://miermere.lofter.com/`(最好是归档页面)
 2. 点击右侧“**导出全部**”按钮
 3. 输入关键词（多个关键词用 `|` 分隔，留空则导出全部）
 4. 等待抓取完成，浏览器会自动下载 ZIP 文件
