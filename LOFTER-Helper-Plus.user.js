@@ -2,9 +2,9 @@
 // @name         LOFTER Helper Plus
 // @name:zh-CN   LOFTER 合集/单篇导出助手（增强版）
 // @namespace    https://github.com/HloYemi/LOFTER-Helper-Plus
-// @version      3.1.8
-// @description  LOFTER 一键导出合集/单篇。支持作者主页批量导出（基于API）、标签搜索、暂停/继续/取消、并发抓取、合集识别、关键词筛选、图片下载。
-// @description:zh-CN  LOFTER 一键导出合集/单篇。支持作者主页批量导出（基于API）、标签搜索、暂停/继续/取消、并发抓取、合集识别、关键词筛选、图片下载。
+// @version      3.2.3
+// @description  LOFTER 一键导出合集/单篇。支持 TXT/Markdown/HTML、日期筛选、API/页面解析切换、暂停/继续/取消、并发抓取、合集识别、关键词筛选、图片下载。
+// @description:zh-CN  LOFTER 一键导出合集/单篇。支持 TXT/Markdown/HTML、日期筛选、API/页面解析切换、暂停/继续/取消、并发抓取、合集识别、关键词筛选、图片下载。
 // @author       Lumiarna, HloYemi
 // @match        *://*.lofter.com/*
 // @grant        GM_setValue
@@ -42,6 +42,10 @@
   const IMG_CONCURRENCY = 4;
   const COLLECTION_PAGE_SIZE = 100;
   const LOOSE_LIMIT = 10000;
+  const MAX_LOOSE_OFFSET = 50_000;
+  const HTTP_RETRIES = 2;
+  const HTTP_RETRY_DELAY = 1000;
+  const IMG_RETRIES = 1;
 
   const isArchive = !location.pathname.includes('/post/');
   const isAuthorHome =
@@ -52,11 +56,11 @@
 
   const GROUP_STRATEGY = { MERGE: 'merge', SINGLE: 'single', SKIP: 'skip' };
   const EXPORT_MODE = { ARCHIVE: 'archive', ORIGIN: 'origin' };
+  const FETCH_MODE = { API: 'api', PAGE: 'page' };
 
   const COLLECTION_SETTINGS_KEY = 'lofter_helper_collection_settings';
   const LEGACY_COLLECTION_STRATEGY_KEY = 'lofter_helper_collection_strategy';
 
-  // 记录上一次批量抓取失败的文章
   let lastFetchFailures = [];
 
   // ==================== 任务控制 ====================
@@ -95,6 +99,7 @@
 
   const settings = {
     format: GM_getValue('lofter_helper_format', 'txt'),
+    fetchMode: GM_getValue('lofter_helper_fetch_mode', FETCH_MODE.API),
     looseStrategy: GM_getValue('lofter_helper_loose_strategy', GROUP_STRATEGY.SINGLE),
     skipImages: GM_getValue('lofter_helper_skip_images', false),
     collectionStrategies: readCollectionStrategies(),
@@ -206,7 +211,8 @@
   }
 
   function isMd() { return settings.format === 'markdown'; }
-  function fileExt() { return isMd() ? 'md' : 'txt'; }
+  function isHtml() { return settings.format === 'html'; }
+  function fileExt() { return isHtml() ? 'html' : isMd() ? 'md' : 'txt'; }
 
   function formatArticle(a, { showTitle = true } = {}) {
     if (isMd()) {
@@ -317,20 +323,207 @@
     return '';
   }
 
+  // ==================== 日期筛选 ====================
+  function parseDateStr(str) {
+    const s = String(str || '').trim().replace(/\//g, '-');
+    let m;
+    if ((m = s.match(/^(\d{4})$/))) {
+      const y = Number(m[1]);
+      return { start: new Date(y, 0, 1), end: new Date(y + 1, 0, 1) };
+    }
+    if ((m = s.match(/^(\d{4})-(\d{1,2})$/))) {
+      const y = Number(m[1]), mo = Number(m[2]) - 1;
+      return { start: new Date(y, mo, 1), end: new Date(y, mo + 1, 1) };
+    }
+    if ((m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/))) {
+      const y = Number(m[1]), mo = Number(m[2]) - 1, d = Number(m[3]);
+      return { start: new Date(y, mo, d), end: new Date(y, mo, d + 1) };
+    }
+    return null;
+  }
+
+  function parseDateFilter(keyword) {
+    const texts = [];
+    let before = null, after = null, exact = null;
+    if (!keyword) return { texts, before, after, exact };
+
+    const parts = keyword.split('|').map(k => k.trim()).filter(Boolean);
+    for (const part of parts) {
+      const m = part.match(/^(before|after|date)[:：](.+)$/i);
+      if (m) {
+        const range = parseDateStr(m[2]);
+        if (range) {
+          const op = m[1].toLowerCase();
+          if (op === 'before') before = range.start;
+          else if (op === 'after') after = range.start;
+          else exact = range;
+          continue;
+        }
+      }
+      texts.push(part.toLowerCase());
+    }
+    return { texts, before, after, exact };
+  }
+
+  function articleTimestamp(article) {
+    const p = article?.publishTime;
+    if (p === undefined || p === null || p === '') return null;
+    if (typeof p === 'number') return p > 0 ? p : null;
+    const s = String(p).trim();
+    const m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T](\d{1,2}):(\d{1,2}))?/);
+    if (!m) return null;
+    const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]) || 0, Number(m[5]) || 0);
+    const ts = d.getTime();
+    return isNaN(ts) ? null : ts;
+  }
+
+  function matchesDateFilter(article, { before, after, exact }) {
+    if (!before && !after && !exact) return true;
+    const ts = articleTimestamp(article);
+    if (ts === null) return false;
+    if (before && ts >= before.getTime()) return false;
+    if (after && ts < after.getTime()) return false;
+    if (exact && (ts < exact.start.getTime() || ts >= exact.end.getTime())) return false;
+    return true;
+  }
+
+  function hasDateFilter({ before, after, exact }) {
+    return Boolean(before || after || exact);
+  }
+
+  // ==================== HTML 工具 ====================
+  function sanitizeContentHtml(html) {
+    if (!html) return '';
+    const doc = new DOMParser().parseFromString(`<div>${html}</div>`, 'text/html');
+    const root = doc.body.firstChild;
+    if (!root) return '';
+    root.querySelectorAll('script, iframe, style, link, meta, object, embed').forEach(el => el.remove());
+    root.querySelectorAll('*').forEach(el => {
+      [...el.attributes].forEach(attr => {
+        if (/^on/i.test(attr.name)) el.removeAttribute(attr.name);
+      });
+    });
+    return root.innerHTML;
+  }
+
+  function collectImagesFromHtml(html) {
+    const urls = [];
+    if (!html) return urls;
+    const doc = new DOMParser().parseFromString(`<div>${html}</div>`, 'text/html');
+    for (const img of doc.querySelectorAll('img')) {
+      const src = img.getAttribute('src') || img.getAttribute('data-src') || '';
+      if (!src) continue;
+      const clean = rewriteImageHost(src.split('?')[0]);
+      if (clean && !urls.includes(clean)) urls.push(clean);
+    }
+    return urls;
+  }
+
+  function rewriteHtmlImages(html, map) {
+    if (!html) return '';
+    const doc = new DOMParser().parseFromString(`<div>${html}</div>`, 'text/html');
+    const root = doc.body.firstChild;
+    if (!root) return '';
+    for (const img of root.querySelectorAll('img')) {
+      const src = img.getAttribute('src') || img.getAttribute('data-src') || '';
+      const clean = src ? rewriteImageHost(src.split('?')[0]) : '';
+      const replacement = clean ? map.get(clean) : '';
+      if (replacement) {
+        img.setAttribute('src', replacement);
+      } else {
+        img.remove();
+        continue;
+      }
+      img.removeAttribute('data-src');
+      img.removeAttribute('srcset');
+    }
+    return root.innerHTML;
+  }
+
+  function hashUrl(url) {
+    let h = 0;
+    for (let i = 0; i < url.length; i++) h = (h * 31 + url.charCodeAt(i)) | 0;
+    return (h >>> 0).toString(36);
+  }
+
+  function blobToDataUrl(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  function wrapHtml(title, bodyHtml, { toc = '' } = {}) {
+    return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(title)}</title>
+<style>
+  body { max-width: 820px; margin: 0 auto; padding: 24px 16px; font: 16px/1.8 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; color: #333; background: #f5f6f8; }
+  article { background: #fff; padding: 24px 32px; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,.06); margin-bottom: 24px; }
+  h1 { font-size: 24px; border-bottom: 2px solid #1e90ff; padding-bottom: 8px; margin-top: 0; }
+  h2 { font-size: 20px; margin-top: 0; }
+  .meta { color: #888; font-size: 13px; margin-bottom: 16px; line-height: 1.6; }
+  .meta a { color: #1e90ff; word-break: break-all; }
+  .content img { max-width: 100%; height: auto; border-radius: 4px; margin: 8px 0; display: block; }
+  .content p { margin: 0 0 12px; }
+  .content blockquote { border-left: 3px solid #ddd; margin: 12px 0; padding: 4px 16px; color: #666; background: #f7f7f7; }
+  .content pre { background: #f4f4f4; padding: 12px; border-radius: 4px; overflow-x: auto; }
+  .content code { background: #f0f0f0; padding: 2px 4px; border-radius: 3px; font-size: .9em; }
+  .toc { background: #fff; padding: 16px 24px; border-radius: 8px; margin-bottom: 24px; box-shadow: 0 1px 4px rgba(0,0,0,.06); }
+  .toc h2 { font-size: 18px; margin: 0 0 12px; }
+  .toc ol { margin: 0; padding-left: 20px; }
+  .toc a { color: #1e90ff; text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  hr.sep { border: none; border-top: 1px dashed #ddd; margin: 32px 0; }
+</style>
+</head>
+<body>
+${toc}
+${bodyHtml}
+</body>
+</html>`;
+  }
+
   function getCookie(name) {
     const m = document.cookie.match(new RegExp('(?:^|; )' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '=([^;]*)'));
     return m ? decodeURIComponent(m[1]) : '';
   }
 
-  // 从 URL 中同时提取 blogdomain、blogId（十六进制）、postId（十六进制）
   function parseLofterUrl(url) {
-    const m = url.match(/https?:\/\/([^/]+\.lofter\.com)\/post\/([0-9a-f]+)_([0-9a-f]+)/);
+    const m = url.match(/https?:\/\/([^/]+\.lofter\.com)\/post\/([0-9a-f]+)_([0-9a-f]+)/i);
     if (!m) return null;
     return {
-      blogdomain: m[1],              // 例如 630384755.lofter.com
-      blogId: parseInt(m[2], 16),    // 例如 0x1d25a177 → 489005431
-      postId: parseInt(m[3], 16),    // 例如 0x34f7c6da9 → 14166919337
+      blogdomain: m[1],
+      blogId: parseInt(m[2], 16),
+      postId: parseInt(m[3], 16),
     };
+  }
+
+  // ==================== 通用请求重试 ====================
+  async function requestWithRetry(opts, { retries = HTTP_RETRIES, delayMs = HTTP_RETRY_DELAY } = {}) {
+    let lastErr;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        const resp = await GM.xmlHttpRequest(opts);
+        if (resp.status === 200) return resp;
+        lastErr = new Error(`HTTP ${resp.status}`);
+        if (resp.status >= 400 && resp.status < 500 && resp.status !== 408 && resp.status !== 429) {
+          throw lastErr;
+        }
+      } catch (e) {
+        lastErr = e;
+        if (e.message && /^HTTP 4\d\d$/.test(e.message) && e.message !== 'HTTP 408' && e.message !== 'HTTP 429') {
+          throw e;
+        }
+      }
+      if (attempt < retries) await delay(delayMs);
+    }
+    throw lastErr || new Error('请求失败');
   }
 
   // ==================== API ====================
@@ -340,7 +533,7 @@
     const url = `https://api.lofter.com/v1.1/postCollection.api?product=${API_PRODUCT}`;
     const body = `method=getCollectionDetail&offset=${offset}&limit=${COLLECTION_PAGE_SIZE}&collectionid=${collectionId}&order=1`;
 
-    const resp = await GM.xmlHttpRequest({
+    const resp = await requestWithRetry({
       method: 'POST',
       url,
       headers: {
@@ -352,10 +545,6 @@
       timeout: 30_000,
     });
 
-    if (resp.status !== 200) {
-      console.warn(`获取合集 ${collectionId} 文章失败 [${resp.status}]`);
-      return { items: [], total: 0 };
-    }
     try {
       const data = JSON.parse(resp.responseText);
       const items = data?.response?.items || [];
@@ -367,14 +556,16 @@
     }
   }
 
-  // 通过 v2.0 blogHomePage.api 获取散章（已验证可用）
-  async function fetchAuthorLoosePostsByApi() {
+  async function fetchAuthorLoosePostsByApi(onProgress) {
     const blogdomain = getArchiveBlogdomain();
     const allPosts = [];
+    const seen = new Set();
     let offset = 0;
+    let total = 0;
 
-    while (true) {
+    while (offset < MAX_LOOSE_OFFSET) {
       await taskControl.checkpoint();
+      onProgress?.(`获取散章 offset=${offset}…`);
 
       const body = new URLSearchParams({
         method: 'getPostLists',
@@ -385,7 +576,7 @@
 
       let resp;
       try {
-        resp = await GM.xmlHttpRequest({
+        resp = await requestWithRetry({
           method: 'POST',
           url: `https://api.lofter.com/v2.0/blogHomePage.api?product=${LOOSE_API_PRODUCT}`,
           headers: {
@@ -396,11 +587,6 @@
         });
       } catch (e) {
         console.warn('[LOFTER Helper] 散章列表请求失败:', e);
-        break;
-      }
-
-      if (resp.status !== 200) {
-        console.warn(`[LOFTER Helper] 散章列表 HTTP ${resp.status}`);
         break;
       }
 
@@ -415,10 +601,16 @@
       const posts = data?.response?.posts || [];
       if (!Array.isArray(posts) || !posts.length) break;
 
+      const respTotal = Number(data?.response?.total);
+      if (respTotal > 0) total = respTotal;
+
+      let newCount = 0;
       for (const raw of posts) {
         const post = raw.post || raw;
         const url = post.blogPageUrl || post.postUrl || '';
-        if (!url) continue;
+        if (!url || seen.has(url)) continue;
+        seen.add(url);
+        newCount++;
 
         const collectionName = post.postCollection?.name || '';
         if (collectionName) continue;
@@ -434,30 +626,33 @@
           tags,
           postId: post.id || post.postId || 0,
           collectionName: '',
+          publishTime: post.publishTime || 0,
         });
       }
 
-      if (posts.length < LOOSE_LIMIT) break;
-      offset += LOOSE_LIMIT;
-      if (offset >= 50_000) break;
+      if (total > 0 && seen.size >= total) break;
+      if (newCount === 0) break;
+
+      offset += posts.length;
+      if (total === 0 && posts.length < 100) break;
+
       await delay(500);
     }
 
-    console.log(`[LOFTER Helper] 散章获取 ${allPosts.length} 篇`);
+    console.log(`[LOFTER Helper] 散章获取 ${allPosts.length} 篇${total > 0 ? `（总数 ${total}）` : ''}`);
     return allPosts;
   }
 
-  async function fetchAuthorPostsByApi() {
+  async function fetchAuthorPostsByApi(onProgress) {
     const allPosts = [];
     const seen = new Set();
 
-    const pushPost = (url, title, tags, postId, collectionName) => {
+    const pushPost = (url, title, tags, postId, collectionName, publishTime) => {
       if (!url || seen.has(url)) return;
       seen.add(url);
-      allPosts.push({ url, title, tags, postId, collectionName });
+      allPosts.push({ url, title, tags, postId, collectionName, publishTime: publishTime || 0 });
     };
 
-    // ---------- 合集 ----------
     let collections = [];
     try {
       collections = await fetchAuthorCollections();
@@ -468,8 +663,10 @@
 
     if (collections.length) {
       console.log(`[LOFTER Helper] 找到 ${collections.length} 个合集`);
-      for (const collection of collections) {
+      for (let idx = 0; idx < collections.length; idx++) {
+        const collection = collections[idx];
         await taskControl.checkpoint();
+        onProgress?.(`获取合集 ${idx + 1}/${collections.length}：${collection.name}`);
         try {
           let offset = 0;
           let fetched = 0;
@@ -482,7 +679,7 @@
               const url = post.blogPageUrl || post.postUrl || '';
               const title = post.title || post.noticeLinkTitle || '';
               const tags = Array.isArray(post.tagList) ? post.tagList.filter(Boolean).join(' ') : '';
-              pushPost(url, title, tags, post.id || post.postId || 0, collection.name);
+              pushPost(url, title, tags, post.id || post.postId || 0, collection.name, post.publishTime);
             }
 
             fetched += items.length;
@@ -503,11 +700,10 @@
       console.log('[LOFTER Helper] 作者无公开合集，继续获取散章');
     }
 
-    // ---------- 散章 ----------
     try {
-      const loosePosts = await fetchAuthorLoosePostsByApi();
+      const loosePosts = await fetchAuthorLoosePostsByApi(onProgress);
       for (const p of loosePosts) {
-        pushPost(p.url, p.title, p.tags, p.postId, p.collectionName);
+        pushPost(p.url, p.title, p.tags, p.postId, p.collectionName, p.publishTime);
       }
     } catch (e) {
       if (e.message === 'CANCELLED') throw e;
@@ -518,7 +714,6 @@
     return allPosts;
   }
 
-  // 单次 API 请求，返回 post 或 null
   async function tryFetchDetailApi(parsed, auth, digest) {
     const params = new URLSearchParams({ product: API_PRODUCT });
     const body = new URLSearchParams({
@@ -533,7 +728,7 @@
     });
 
     try {
-      const resp = await GM.xmlHttpRequest({
+      const resp = await requestWithRetry({
         method: 'POST',
         url: `https://api.lofter.com/oldapi/post/detail.api?${params}`,
         headers: {
@@ -545,36 +740,35 @@
         },
         data: body.toString(),
         timeout: 15_000,
-      });
+      }, { retries: 1, delayMs: 500 });
 
-      if (resp.status !== 200) return null;
       const data = JSON.parse(resp.responseText);
-      return data.response?.posts?.[0]?.post || null;
-    } catch {
-      return null;
+      const post = data.response?.posts?.[0]?.post || null;
+      return { post, reason: post ? '' : 'empty' };
+    } catch (e) {
+      return { post: null, reason: e.message || 'network' };
     }
   }
 
-  // 通过 article 详情 API 抓取，两种 postdigestnew 兜底
   async function fetchPostDetail(url) {
     await taskControl.checkpoint();
     const parsed = parseLofterUrl(url);
-    if (!parsed) return null;
+    if (!parsed) return { post: null, reason: '无法解析 URL' };
 
     const auth = getCookie('LOFTER-PHONE-LOGIN-AUTH');
+    let lastReason = '';
 
-    // 第一次尝试全文，第二次尝试摘要（部分文章 postdigestnew=0 会空）
     for (const digest of ['0', '1']) {
-      const post = await tryFetchDetailApi(parsed, auth, digest);
-      if (post) return post;
+      const { post, reason } = await tryFetchDetailApi(parsed, auth, digest);
+      if (post) return { post, reason: '' };
+      lastReason = reason;
     }
-    return null;
+    return { post: null, reason: lastReason || 'unknown' };
   }
 
-  // Fallback：直接请求文章 HTML 页面，用 DOMParser 提取正文
   async function fetchArticleFromHtml(url) {
     try {
-      const resp = await GM.xmlHttpRequest({
+      const resp = await requestWithRetry({
         method: 'GET',
         url,
         timeout: 15_000,
@@ -582,9 +776,7 @@
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
           'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         },
-      });
-
-      if (resp.status !== 200) return null;
+      }, { retries: 1, delayMs: 500 });
 
       const doc = new DOMParser().parseFromString(resp.responseText, 'text/html');
       const title = doc.querySelector('.post-title, h1.title, .m-title, .article-title')?.textContent.trim() || '';
@@ -593,8 +785,8 @@
       if (!bodyEl) return null;
       const content = extractText(bodyEl);
       if (!content) return null;
+      const contentHtml = sanitizeContentHtml(bodyEl.innerHTML);
 
-      // 图片提取
       const images = [];
       for (const img of bodyEl.querySelectorAll('img')) {
         const src = img.getAttribute('src') || img.getAttribute('data-src') || '';
@@ -607,6 +799,7 @@
         url,
         title: title || '未命名',
         content,
+        contentHtml,
         images,
         publishTime: '',
         collectionId: '',
@@ -614,24 +807,23 @@
         pos: 0,
       };
     } catch (e) {
-      console.warn(`[LOFTER Helper] HTML fallback 失败 [${url}]:`, e);
+      console.warn(`[LOFTER Helper] HTML fallback 失败 [${url}]:`, e.message);
       return null;
     }
   }
 
   async function fetchArticle(url) {
-    const post = await fetchPostDetail(url);
+    const { post, reason } = await fetchPostDetail(url);
     if (post) return parseApiArticle(post);
 
-    // 详情 API 两种 digest 都失败，走 HTML fallback
-    console.warn(`[LOFTER Helper] 详情 API 失败，尝试 HTML 抓取: ${url}`);
+    console.warn(`[LOFTER Helper] 详情 API 失败（${reason}），尝试 HTML 抓取: ${url}`);
     const htmlArticle = await fetchArticleFromHtml(url);
     if (htmlArticle) {
       console.log(`[LOFTER Helper] HTML fallback 成功: ${url}`);
       return htmlArticle;
     }
 
-    throw new Error('详情 API 与 HTML 抓取均失败');
+    throw new Error(`详情 API（${reason}）与 HTML 抓取均失败`);
   }
 
   async function fetchAuthorCollections() {
@@ -643,7 +835,7 @@
       blogdomain: getArchiveBlogdomain(),
       product: API_PRODUCT,
     });
-    const resp = await GM.xmlHttpRequest({
+    const resp = await requestWithRetry({
       method: 'GET',
       url: `https://api.lofter.com/v1.1/postCollection.api?${params.toString()}`,
       headers: {
@@ -694,6 +886,7 @@
   function parseApiArticle(post) {
     const doc = new DOMParser().parseFromString(`<div class="post-content">${post.content}</div>`, 'text/html');
     const content = extractText(doc.body);
+    const contentHtml = sanitizeContentHtml(post.content || '');
     const images = extractImages(post);
     const captionText = (post.caption || '').replace(/<[^>]+>/g, '').trim();
     const title = post.title
@@ -703,7 +896,7 @@
       || '未命名';
     return {
       url: post.blogPageUrl || '',
-      title, content, images,
+      title, content, contentHtml, images,
       publishTime: post.publishTime ? formatDate(post.publishTime) : '',
       collectionId: post.postCollection?.id ? String(post.postCollection.id) : '',
       collectionName: post.postCollection?.name || '',
@@ -711,29 +904,42 @@
     };
   }
 
-  async function autoScroll() {
-    let lastCount = 0, stable = 0;
-    for (let i = 0; i < SCROLL_MAX_ATTEMPTS; i++) {
-      await taskControl.checkpoint();
-      window.scrollTo(0, document.body.scrollHeight);
-      await delay(SCROLL_INTERVAL);
-      const count = $$("a[href*='/post/']").length;
-      if (count === lastCount) { if (++stable >= 3) break; }
-      else { stable = 0; lastCount = count; }
-    }
-    return lastCount;
-  }
+  async function autoScrollAndCollect(onProgress) {
+    const collected = new Map();
+    const record = () => {
+      for (const el of $$("a[href*='/post/']")) {
+        const url = el.href;
+        if (!url || collected.has(url)) continue;
+        const h3 = el.querySelector('h3');
+        const title = h3?.textContent.trim() || el.querySelector('p')?.textContent.replace(/\s+/g, ' ').trim() || '';
+        collected.set(url, { url, title });
+      }
+    };
 
-  function extractArticleLinks() {
-    const map = new Map();
-    for (const el of $$("a[href*='/post/']")) {
-      const url = el.href;
-      if (!url || map.has(url)) continue;
-      const h3 = el.querySelector('h3');
-      const title = h3?.textContent.trim() || el.querySelector('p')?.textContent.replace(/\s+/g, ' ').trim() || '';
-      map.set(url, { url, title });
+    record();
+    const observer = new MutationObserver(record);
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    let lastCount = collected.size;
+    let stable = 0;
+    try {
+      for (let i = 0; i < SCROLL_MAX_ATTEMPTS; i++) {
+        await taskControl.checkpoint();
+        window.scrollTo(0, document.body.scrollHeight);
+        await delay(SCROLL_INTERVAL);
+        record();
+        onProgress?.(`页面滚动中，已收集 ${collected.size} 篇…`);
+        if (collected.size === lastCount) {
+          if (++stable >= 3) break;
+        } else {
+          stable = 0;
+          lastCount = collected.size;
+        }
+      }
+    } finally {
+      observer.disconnect();
     }
-    return [...map.values()];
+    return [...collected.values()];
   }
 
   async function fetchAll(articles, onProgress) {
@@ -775,8 +981,36 @@
     return successArticles;
   }
 
+  async function retryFailedFetch(setStatus) {
+    if (!lastFetchFailures.length) return [];
+    const retryLinks = lastFetchFailures.map(f => ({ url: f.url, title: '' }));
+    lastFetchFailures = [];
+    setStatus(`重试失败文章（${retryLinks.length} 篇）…`);
+    return fetchAll(retryLinks, (cur, tot) => setStatus(`重试抓取 ${cur}/${tot}…`));
+  }
+
   function exportSingle(article) {
     downloadBlob(new Blob([`${formatArticle(article)}\n`], { type: 'text/plain;charset=utf-8' }), FileNames.singleTextFile(article));
+  }
+
+  async function exportSingleHtml(article, onProgress) {
+    const urls = collectImagesFromHtml(article.contentHtml || '');
+    const urlToData = new Map();
+    let done = 0;
+    for (const u of urls) {
+      await taskControl.checkpoint();
+      const blob = await fetchImageAsBlob(u);
+      if (blob) urlToData.set(u, await blobToDataUrl(blob));
+      done++;
+      onProgress?.(`下载图片 ${done}/${urls.length}`);
+    }
+    const bodyHtml = rewriteHtmlImages(article.contentHtml || '', urlToData);
+    const html = wrapHtml(article.title, `<article>
+    <h1>${escapeHtml(article.title)}</h1>
+    <div class="meta">原文地址：<a href="${escapeHtml(article.url)}">${escapeHtml(article.url)}</a><br>发布时间：${escapeHtml(article.publishTime || '未知')}</div>
+    <div class="content">${bodyHtml}</div>
+  </article>`);
+    downloadBlob(new Blob([html], { type: 'text/html;charset=utf-8' }), FileNames.singleTextFile(article));
   }
 
   function mergeArticles(articles, { collectionName = '', skipSort = false } = {}) {
@@ -892,6 +1126,95 @@
     downloadBlob(new Blob([zipped], { type: 'application/zip' }), `${folder}.zip`);
   }
 
+  async function exportArchiveHtml(articles, keyword, onProgress) {
+    const folder = FileNames.archiveFolder({ keyword });
+    const files = {};
+    const collectionGroups = new Map();
+    const looseArticles = [];
+    for (const a of articles) {
+      if (a.collectionName) {
+        if (!collectionGroups.has(a.collectionName)) collectionGroups.set(a.collectionName, []);
+        collectionGroups.get(a.collectionName).push(a);
+      } else looseArticles.push(a);
+    }
+
+    const urlToPath = new Map();
+    const allUrls = new Set();
+    for (const a of articles) {
+      for (const u of collectImagesFromHtml(a.contentHtml || '')) allUrls.add(u);
+    }
+    let imgDone = 0;
+    const imgTotal = allUrls.size;
+    for (const url of allUrls) {
+      await taskControl.checkpoint();
+      const blob = await fetchImageAsBlob(url);
+      if (blob) {
+        const path = `images/${hashUrl(url)}.${imageExt(url)}`;
+        files[`${folder}/${path}`] = new Uint8Array(await blob.arrayBuffer());
+        urlToPath.set(url, path);
+      } else {
+        console.warn(`图片下载失败（HTML 中将移除）: ${url}`);
+      }
+      imgDone++;
+      onProgress?.(`下载图片 ${imgDone}/${imgTotal}`);
+    }
+
+    const makeArticleBlock = (a, id) => `<article id="${id}">
+    <h2>${escapeHtml(a.title)}</h2>
+    <div class="meta">原文地址：<a href="${escapeHtml(a.url)}">${escapeHtml(a.url)}</a><br>发布时间：${escapeHtml(a.publishTime || '未知')}${a.collectionName ? `<br>合集：${escapeHtml(a.collectionName)}` : ''}</div>
+    <div class="content">${rewriteHtmlImages(a.contentHtml || '', urlToPath)}</div>
+  </article>`;
+
+    const writeMerged = (name, list) => {
+      const sorted = [...list].sort((a, b) => a.pos - b.pos);
+      const toc = sorted.length > 1
+        ? `<div class="toc"><h2>目录</h2><ol>${sorted.map((a, i) => `<li><a href="#a${i}">${escapeHtml(a.title)}</a></li>`).join('')}</ol></div>`
+        : '';
+      const blocks = sorted.map((a, i) => makeArticleBlock(a, `a${i}`)).join('\n<hr class="sep">\n');
+      const title = name ? `${name} - ${author}` : `散章 - ${author}`;
+      files[`${folder}/${safeFileName(title)}.html`] = fflate.strToU8(wrapHtml(title, blocks, { toc }));
+    };
+
+    const writeSingles = (list, prefix) => {
+      const sorted = [...list].sort((a, b) => a.pos - b.pos);
+      const width = sequenceWidth(sorted.length);
+      sorted.forEach((a, i) => {
+        const html = wrapHtml(a.title, `<article>
+    <h1>${escapeHtml(a.title)}</h1>
+    <div class="meta">原文地址：<a href="${escapeHtml(a.url)}">${escapeHtml(a.url)}</a><br>发布时间：${escapeHtml(a.publishTime || '未知')}</div>
+    <div class="content">${rewriteHtmlImages(a.contentHtml || '', urlToPath)}</div>
+  </article>`);
+        const name = prefix
+          ? `${prefix}/${String(i + 1).padStart(width, '0')}_${safeFileName(a.title)}`
+          : `${String(i + 1).padStart(width, '0')}_${safeFileName(a.title)}`;
+        files[`${folder}/${name}.html`] = fflate.strToU8(html);
+      });
+    };
+
+    for (const [name, group] of collectionGroups) {
+      const strategy = getCollectionStrategy(name);
+      if (strategy === GROUP_STRATEGY.SKIP) continue;
+      if (strategy === GROUP_STRATEGY.MERGE) writeMerged(name, group);
+      else writeSingles(group, safeFileName(name));
+    }
+    if (settings.looseStrategy === GROUP_STRATEGY.MERGE && looseArticles.length) {
+      writeMerged(keyword || '', [...looseArticles].reverse());
+    } else if (settings.looseStrategy === GROUP_STRATEGY.SINGLE) {
+      writeSingles(looseArticles, '');
+    }
+
+    if (taskControl.isCancelled()) throw new Error('CANCELLED');
+    if (!Object.keys(files).length) throw new Error('当前设置会跳过全部内容，没有可导出的文章');
+
+    onProgress?.('正在打包 ZIP…');
+    await delay(50);
+    const zipped = await new Promise((resolve, reject) => {
+      fflate.zip(files, { level: 6 }, (err, data) => err ? reject(err) : resolve(data));
+    });
+    onProgress?.('正在下载 ZIP…');
+    downloadBlob(new Blob([zipped], { type: 'application/zip' }), `${folder}.zip`);
+  }
+
   async function downloadImages(article, onProgress) {
     if (!article.images?.length) return;
     const imageWidth = sequenceWidth(article.images.length);
@@ -918,28 +1241,35 @@
     let cleanUrl = imgUrl.split('?')[0];
     cleanUrl = rewriteImageHost(cleanUrl);
     cleanUrl = cleanUrl.replace(/^http:/, 'https:');
-    try {
-      const resp = await GM.xmlHttpRequest({
-        method: 'GET', url: cleanUrl, responseType: 'blob', timeout: 30_000,
-        headers: {
-          'Referer': 'https://www.lofter.com/',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
-        },
-      });
-      if (resp.status !== 200) {
-        console.warn(`图片下载失败 [${resp.status}]: ${cleanUrl}`);
+
+    for (let attempt = 0; attempt <= IMG_RETRIES; attempt++) {
+      try {
+        const resp = await GM.xmlHttpRequest({
+          method: 'GET', url: cleanUrl, responseType: 'blob', timeout: 30_000,
+          headers: {
+            'Referer': 'https://www.lofter.com/',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+          },
+        });
+        if (resp.status !== 200) {
+          if (attempt < IMG_RETRIES) { await delay(500); continue; }
+          console.warn(`图片下载失败 [${resp.status}]: ${cleanUrl}`);
+          return null;
+        }
+        if (!resp.response || resp.response.size === 0) {
+          if (attempt < IMG_RETRIES) { await delay(500); continue; }
+          console.warn(`图片响应为空: ${cleanUrl}`);
+          return null;
+        }
+        return resp.response;
+      } catch (e) {
+        if (attempt < IMG_RETRIES) { await delay(500); continue; }
+        console.warn(`图片下载异常: ${cleanUrl}`, e);
         return null;
       }
-      if (!resp.response || resp.response.size === 0) {
-        console.warn(`图片响应为空: ${cleanUrl}`);
-        return null;
-      }
-      return resp.response;
-    } catch (e) {
-      console.warn(`图片下载异常: ${cleanUrl}`, e);
-      return null;
     }
+    return null;
   }
 
   // ==================== UI ====================
@@ -972,12 +1302,15 @@
       .settings-panel .group-title { font-size: 12px; color: #888; margin: 10px 0 4px; font-weight: 500; text-align: center; }
       .settings-panel .option-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); column-gap: 8px; width: 100%; margin: 0 0 8px; }
       .settings-panel .option-row-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 16px; width: 100%; margin: 0 0 8px; }
+      .settings-panel .option-column { display: flex; flex-direction: column; gap: 2px; margin: 0 0 8px; }
       .settings-panel .option-row label { margin: 0; min-width: 0; justify-content: center; }
       .settings-panel .option-row-2 label { margin: 0; min-width: 0; justify-content: center; }
+      .settings-panel .option-column label { margin: 0; justify-content: flex-start; }
       .settings-panel .settings-note { margin-top: 8px; font-size: 12px; color: #b26a00; text-align: center; }
       .settings-panel .checkbox-row { display: flex; align-items: center; justify-content: center; gap: 6px; margin: 6px 0 8px; font-size: 13px; }
       .settings-panel .checkbox-row input[type="checkbox"] { margin: 0; accent-color: #1e90ff; }
       .settings-panel .collection-display { font-size: 13px; color: #555; text-align: center; margin: 2px 0 4px; word-break: break-all; }
+      .settings-panel .retry-collections { color: #1e90ff; text-decoration: underline; cursor: pointer; }
     </style>`;
     return shadow;
   }
@@ -1007,7 +1340,7 @@
       </div>`;
       }).join('') : '';
     const collectionStatusHtml = isArchive && collectionsLoadError
-      ? `<div class="settings-note">${escapeHtml(collectionsLoadError)}</div>` : '';
+      ? `<div class="settings-note">${escapeHtml(collectionsLoadError)} <a href="#" class="retry-collections">重试</a></div>` : '';
     const btn = document.createElement('div');
     btn.className = 'settings-btn';
     btn.textContent = '⚙';
@@ -1017,9 +1350,15 @@
     panel.innerHTML = `
       <h3>设置</h3>
       <div class="group-title">导出格式</div>
-      <div class="option-row-2">
+      <div class="option-column">
         <label><input type="radio" name="fmt" value="markdown"${settings.format === 'markdown' ? ' checked' : ''}> Markdown</label>
         <label><input type="radio" name="fmt" value="txt"${settings.format === 'txt' ? ' checked' : ''}> TXT</label>
+        <label><input type="radio" name="fmt" value="html"${settings.format === 'html' ? ' checked' : ''}> HTML</label>
+      </div>
+      <div class="group-title">抓取方式</div>
+      <div class="option-row-2">
+        <label><input type="radio" name="fetch-mode" value="${FETCH_MODE.API}"${settings.fetchMode === FETCH_MODE.API ? ' checked' : ''}> API</label>
+        <label><input type="radio" name="fetch-mode" value="${FETCH_MODE.PAGE}"${settings.fetchMode === FETCH_MODE.PAGE ? ' checked' : ''}> 页面解析</label>
       </div>
       <div class="checkbox-row">
         <label><input type="checkbox" name="skip-images"${settings.skipImages ? ' checked' : ''}> 跳过图片</label>
@@ -1038,7 +1377,7 @@
     root.append(panel);
     btn.addEventListener('click', async () => {
       panel.classList.toggle('open');
-      if (panel.classList.contains('open') && isArchive && !archiveCollections.length) {
+      if (panel.classList.contains('open') && isArchive && !archiveCollections.length && !collectionsLoadError) {
         try {
           archiveCollections = await fetchAuthorCollections();
           syncCollectionStrategies(archiveCollections);
@@ -1051,8 +1390,35 @@
         createSettingsUI();
       }
     });
+    const retryLink = panel.querySelector('.retry-collections');
+    if (retryLink) {
+      retryLink.addEventListener('click', async (e) => {
+        e.preventDefault();
+        collectionsLoadError = '';
+        retryLink.textContent = '加载中…';
+        try {
+          archiveCollections = await fetchAuthorCollections();
+          syncCollectionStrategies(archiveCollections);
+          if (!archiveCollections.length) collectionsLoadError = '当前作者无公开合集。';
+        } catch (err) {
+          collectionsLoadError = `合集配置加载失败：${err.message}`;
+        }
+        btn.remove();
+        panel.remove();
+        createSettingsUI();
+      });
+    }
     panel.querySelectorAll('input[name="fmt"]').forEach(radio => {
       radio.addEventListener('change', () => { settings.format = radio.value; GM_setValue('lofter_helper_format', radio.value); });
+    });
+    panel.querySelectorAll('input[name="fetch-mode"]').forEach(radio => {
+      radio.addEventListener('change', () => {
+        settings.fetchMode = radio.value;
+        GM_setValue('lofter_helper_fetch_mode', radio.value);
+        // 切换模式后清空缓存，避免沿用另一模式的列表
+        apiPostLinks = [];
+        apiPostLinksBlogdomain = '';
+      });
     });
     panel.querySelectorAll('input[data-collection-name]').forEach(radio => {
       radio.addEventListener('change', () => { setCollectionStrategy(radio.dataset.collectionName, radio.value); });
@@ -1124,10 +1490,43 @@
       return { keyword: '', links: [{ url: location.href, title: '' }] };
     }
 
+    // ---------- 页面解析模式 ----------
+    if (settings.fetchMode === FETCH_MODE.PAGE) {
+      setStatus('页面解析模式，正在滚动收集…');
+      const collected = await autoScrollAndCollect(setStatus);
+      if (!collected.length) {
+        alert('页面未收集到任何文章链接，请确认当前页面是作者主页。');
+        return null;
+      }
+      setStatus(`已收集 ${collected.length} 篇，正在筛选…`);
+      const keyword = prompt(
+        `已收集 ${collected.length} 篇文章链接。\n` +
+        `请输入关键词（多个关键词用 | 分隔，留空则导出全部）：\n` +
+        `注意：页面解析模式无法获取发布时间，日期筛选不可用`
+      );
+      if (keyword === null) return null;
+
+      const parsed = parseDateFilter(keyword);
+      if (hasDateFilter(parsed)) {
+        alert('页面解析模式没有发布时间，日期条件已被忽略。如需日期筛选请切换到 API 模式。');
+      }
+
+      let links = collected;
+      if (parsed.texts.length) {
+        links = links.filter(a => {
+          const haystack = `${a.title || ''}`.toLowerCase();
+          return parsed.texts.some(k => haystack.includes(k));
+        });
+      }
+      if (!links.length) { alert('未找到匹配的文章'); return null; }
+      return { keyword: parsed.texts.join('-'), links };
+    }
+
+    // ---------- API 模式 ----------
     const currentBlogdomain = getArchiveBlogdomain();
     if (!apiPostLinks.length || apiPostLinksBlogdomain !== currentBlogdomain) {
       setStatus('正在通过 API 获取文章列表…');
-      apiPostLinks = await fetchAuthorPostsByApi();
+      apiPostLinks = await fetchAuthorPostsByApi(setStatus);
       apiPostLinksBlogdomain = currentBlogdomain;
     }
 
@@ -1136,20 +1535,27 @@
       const keyword = prompt(
         `已获取到 ${apiPostLinks.length} 篇文章。\n` +
         `请输入关键词（多个关键词用 | 分隔，留空则导出全部）：\n` +
-        `提示：匹配标题、标签和合集名，不区分大小写`
+        `关键词匹配：标题、标签、合集名，不区分大小写\n` +
+        `日期筛选：before:2020-01-01、after:2020、date:2020-06`
       );
       if (keyword === null) return null;
 
-      const keywords = keyword
-        ? keyword.split('|').map(k => k.trim().toLowerCase()).filter(Boolean)
-        : [];
-
+      const parsed = parseDateFilter(keyword);
       let links = [...apiPostLinks];
-      if (keywords.length) {
+
+      if (parsed.texts.length) {
         links = links.filter(a => {
           const haystack = `${a.title} ${a.tags || ''} ${a.collectionName || ''}`.toLowerCase();
-          return keywords.some(k => haystack.includes(k));
+          return parsed.texts.some(k => haystack.includes(k));
         });
+      }
+
+      if (hasDateFilter(parsed)) {
+        const beforeCount = links.length;
+        const noDateCount = links.filter(a => articleTimestamp(a) === null).length;
+        links = links.filter(a => matchesDateFilter(a, parsed));
+        const note = noDateCount > 0 ? `（${noDateCount} 篇无发布时间被排除）` : '';
+        console.log(`[LOFTER Helper] 日期筛选：${beforeCount} → ${links.length} 篇${note}`);
       }
 
       if (!links.length) {
@@ -1161,23 +1567,34 @@
         return null;
       }
 
-      return { keyword: keywords.join('-'), links };
+      return { keyword: parsed.texts.join('-'), links };
     }
 
+    // ---------- API 失败，回退到页面解析 ----------
     setStatus('API 获取失败，回退到页面解析…');
-    const totalCount = await autoScroll();
-    setStatus(`已加载 ${totalCount} 篇，正在筛选…`);
-    let links = extractArticleLinks();
-    const keyword = prompt('请输入关键词（多个关键词用 | 分隔，留空则导出全部）：');
+    const collected = await autoScrollAndCollect(setStatus);
+    setStatus(`已收集 ${collected.length} 篇，正在筛选…`);
+    const keyword = prompt(
+      `API 获取失败，已回退到页面解析，收集到 ${collected.length} 篇。\n` +
+      `请输入关键词（多个关键词用 | 分隔，留空则导出全部）：\n` +
+      `注意：此模式无法获取发布时间，日期筛选不可用`
+    );
     if (keyword === null) return null;
-    const keywords = keyword
-      ? keyword.split('|').map(k => k.trim().toLowerCase()).filter(Boolean)
-      : [];
-    if (keywords.length) {
-      links = links.filter(a => `${a.title}`.toLowerCase().includes(keywords[0]));
+
+    const parsed = parseDateFilter(keyword);
+    if (hasDateFilter(parsed)) {
+      alert('回退模式下没有发布时间，日期条件已被忽略。');
+    }
+
+    let links = collected;
+    if (parsed.texts.length) {
+      links = links.filter(a => {
+        const haystack = `${a.title || ''}`.toLowerCase();
+        return parsed.texts.some(k => haystack.includes(k));
+      });
     }
     if (!links.length) { alert('未找到匹配的文章'); return null; }
-    return { keyword: keywords.join('-'), links };
+    return { keyword: parsed.texts.join('-'), links };
   }
 
   async function fetchArticlesForExport(links, setStatus) {
@@ -1188,8 +1605,19 @@
 
   async function executeExport(mode, articles, keyword, setStatus) {
     if (mode === EXPORT_MODE.ARCHIVE) {
+      if (isHtml()) {
+        setStatus(`正在打包 ${articles.length} 篇为 HTML ZIP…`);
+        await exportArchiveHtml(articles, keyword, setStatus);
+        return;
+      }
       setStatus(`正在打包 ${articles.length} 篇为 ZIP…`);
       await exportArchive(articles, keyword, setStatus);
+      return;
+    }
+    if (!articles.length) throw new Error('抓取失败，没有可导出的文章');
+    if (isHtml()) {
+      setStatus(`正在生成 HTML：${articles[0].title}`);
+      await exportSingleHtml(articles[0], setStatus);
       return;
     }
     exportSingle(articles[0]);
@@ -1231,7 +1659,11 @@
 
       if (mode === EXPORT_MODE.ARCHIVE) {
         const labels = { merge: '合并', single: '单篇', skip: '跳过' };
-        const lines = [`- LOFTER 导出策略`, `\t- 散章：${labels[settings.looseStrategy]}`];
+        const lines = [
+          `- LOFTER 导出策略`,
+          `\t- 抓取方式：${settings.fetchMode === FETCH_MODE.API ? 'API' : '页面解析'}`,
+          `\t- 散章：${labels[settings.looseStrategy]}`,
+        ];
         for (const [name, s] of Object.entries(settings.collectionStrategies)) lines.push(`\t- ${name}：${labels[s] || s}`);
         console.log(lines.join('\n'));
       }
@@ -1239,8 +1671,17 @@
       const context = await resolveExportContext(setStatus);
       if (!context) return;
 
-      const articles = await fetchArticlesForExport(context.links, setStatus);
+      let articles = await fetchArticlesForExport(context.links, setStatus);
       if (mode === EXPORT_MODE.ORIGIN) updateCollectionDisplay(articles[0]?.collectionName);
+
+      if (lastFetchFailures.length > 0) {
+        const retry = confirm(`有 ${lastFetchFailures.length} 篇抓取失败，是否重试？`);
+        if (retry) {
+          const retried = await retryFailedFetch(setStatus);
+          articles = [...articles, ...retried];
+        }
+      }
+
       await executeExport(mode, articles, context.keyword, setStatus);
 
       alert(buildCompletionMessage(mode, articles));
@@ -1281,7 +1722,7 @@
     } else {
       initPageActions([{ label: '导出本篇', modifier: 'success', mode: EXPORT_MODE.ORIGIN }]);
       fetchPostDetail(location.href)
-        .then(post => updateCollectionDisplay(post?.postCollection?.name || ''))
+        .then(({ post }) => updateCollectionDisplay(post?.postCollection?.name || ''))
         .catch(() => updateCollectionDisplay(''));
     }
   }
